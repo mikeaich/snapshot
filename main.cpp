@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <libgen.h>     // for basename()
 #include <unistd.h>
+#include <pthread.h>
 #include <utils/Log.h>
 #include <hardware/camera.h>
 #include <camera/CameraParameters.h>
@@ -32,14 +33,38 @@
 
 using namespace android;
 
-static volatile bool exitMe = false;
+/*
+    Events framework
+*/
+typedef enum {
+    NO_EVENT,
+    PREVIEW_STARTED,
+    AUTO_FOCUSED,
+    IMAGE_CAPTURED,
+    ABORT,
+    ERROR
+} CAM_EVENT;
+
+static volatile CAM_EVENT   event   = NO_EVENT;
+static pthread_mutex_t      lock    = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t       cond    = PTHREAD_COND_INITIALIZER;
+
+static void fireEvent( CAM_EVENT e )
+{
+    LOGD( "fireEvent %d", e );
+    
+    pthread_mutex_lock( &lock );
+    event = e;
+    pthread_cond_signal( &cond );
+    pthread_mutex_unlock( &lock );
+}
 
 static void handleSigInt( int sig )
 {
     switch( sig ) {
         case SIGINT:
             printf( "\nGot SIGINT, exiting...\n" );
-            exitMe = true;
+            fireEvent( ABORT );
             break;
         
         default:
@@ -61,9 +86,13 @@ static void snapshot_notify_callback( int32_t msgType, int32_t ext1, int32_t ext
 {
     switch( msgType ) {
         case android::CAMERA_MSG_FOCUS:
-            fprintf( stderr, "complete\n" );
-            LOGD( "Autofocus complete" );
-            exitMe = true;
+            if( ext1 ) {
+                LOGD( "Autofocus complete" );
+                fireEvent( AUTO_FOCUSED );
+            } else {
+                LOGD( "Autofocus failed" );
+                fireEvent( ERROR );
+            }
             break;
 
         default:
@@ -79,6 +108,7 @@ static void snapshot_data_callback( int32_t msgType, const sp<IMemory> &dataPtr,
 #endif
 {
     static int previewFrames = 0;
+    static bool previewStarted = false;
 
     switch( msgType ) {
         case android::CAMERA_MSG_PREVIEW_FRAME:
@@ -87,6 +117,15 @@ static void snapshot_data_callback( int32_t msgType, const sp<IMemory> &dataPtr,
                 LOGD( "Got 30 preview frames" );
                 previewFrames = 0;
             }
+            if( !previewStarted ) {
+                fireEvent( PREVIEW_STARTED );
+                previewStarted = true;
+            }
+            break;
+            
+        case android::CAMERA_MSG_COMPRESSED_IMAGE:
+            LOGD( "Got compressed image: data=%p, length=%d", dataPtr->pointer(), dataPtr->size() );
+            fireEvent( IMAGE_CAPTURED );
             break;
 
         default:
@@ -273,31 +312,79 @@ int main( int argc, char* argv[] )
         calling autoFocus(), or things just don't work.
         Nice going there, Android.
     */
+    fprintf( stderr, "Starting preview..." );
+    LOGD( "Starting preview..." );
+    fflush( stderr );
     camera->enableMsgType( android::CAMERA_MSG_PREVIEW_FRAME );
     if( ( s = camera->startPreview() ) != OK ) {
         fprintf( stderr, "Unable to start preview: %d\n", s );
         LOGE( "Unable to start preview: %d", s );
         return 1;
     }
-
-    if( autoFocus ) {
-        camera->enableMsgType( android::CAMERA_MSG_FOCUS );
-        fprintf( stderr, "Starting autofocus..." );
-        LOGD( "Starting autofocus..." );
-        fflush( stderr );
-        if( ( s = camera->autoFocus() ) != OK ) {
-            fprintf( stderr, "failure (%d)\n", s );
-            LOGE( "Autofocus failed: %d", s );
-            return 1;
+   
+    LOGD( "----- Entering event loop -----" );
+    bool exit = false;
+    while( !exit ) {
+        switch( event ) {
+            case NO_EVENT:
+                pthread_mutex_lock( &lock );
+                pthread_cond_wait( &cond, &lock );
+                LOGD( "Got event %d", event );
+                continue;
+            
+            case ABORT:
+                exit = true;
+                break;
+            
+            case PREVIEW_STARTED:
+                if( autoFocus ) {
+                    camera->enableMsgType( android::CAMERA_MSG_FOCUS );
+                    fprintf( stderr, "Starting autofocus..." );
+                    LOGD( "Starting autofocus..." );
+                    fflush( stderr );
+                    if( ( s = camera->autoFocus() ) != OK ) {
+                        fprintf( stderr, "failure (%d)\n", s );
+                        LOGE( "Autofocus failed: %d", s );
+                        return 1;
+                    }
+                    break;
+                }
+                // fallthrough if autoFocus is not set
+            
+            case AUTO_FOCUSED:
+                camera->enableMsgType( android::CAMERA_MSG_COMPRESSED_IMAGE );
+                fprintf( stderr, "OK\nTaking picture..." );
+                LOGD( "Taking picture..." );
+                fflush( stderr );
+                if( ( s = camera->takePicture() ) != OK ) {
+                    fprintf( stderr, "failure (%d)\n", s );
+                    LOGE( "Take picture failed: %d", s );
+                    return 1;
+                }
+                break;
+            
+            case IMAGE_CAPTURED:
+                // save picture and exit
+                fprintf( stderr, "OK\n" );
+                LOGD( "Image captured" );
+                
+                exit = true;
+                break;
+            
+            case ERROR:
+                fprintf( stderr, "An error occured--check logcat\n" );
+                return 1;
+            
+            default:
+                fprintf( stderr, "Weird, unhandled event %d\n", event );
+                break;
         }
+        
+        event = NO_EVENT;
+        pthread_mutex_unlock( &lock );
     }
-    
-    LOGD( "----- Entering while loop -----" );
-    while( !exitMe ) {
-        ;
-    }
-    LOGD( "----- Leaving while loop -----" );
-    
+    LOGD( "----- Leaving event loop -----" );
+
     camera->stopPreview();
     camera->release();
     
