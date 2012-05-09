@@ -101,6 +101,9 @@ static void snapshot_notify_callback( int32_t msgType, int32_t ext1, int32_t ext
     }
 }
 
+static volatile char* data;
+static volatile size_t length;
+
 #if NO_METADATA
 static void snapshot_data_callback( int32_t msgType, const sp<IMemory> &dataPtr, void* user )
 #else
@@ -124,8 +127,16 @@ static void snapshot_data_callback( int32_t msgType, const sp<IMemory> &dataPtr,
             break;
             
         case android::CAMERA_MSG_COMPRESSED_IMAGE:
-            LOGD( "Got compressed image: data=%p, length=%d", dataPtr->pointer(), dataPtr->size() );
-            fireEvent( IMAGE_CAPTURED );
+            length = dataPtr->size();
+            LOGD( "Got compressed image: data=%p, length=%d", dataPtr->pointer(), length );
+            data = (char*)malloc( length );
+            if( data ) {
+                memcpy( (void*)data, dataPtr->pointer(), length );
+                fireEvent( IMAGE_CAPTURED );
+            } else {
+                LOGE( "Failed to allocate %d bytes for compressed image", length );
+                fireEvent( ERROR );
+            }
             break;
 
         default:
@@ -223,6 +234,25 @@ static void dumpCurrentParameters( sp<CameraHardwareInterface_ICS> camera, uint3
     fprintf( stderr, "\tSmooth zoom:                   %s\n", p.get( p.KEY_SMOOTH_ZOOM_SUPPORTED ) );
 }
 
+static bool setParameter( sp<CameraHardwareInterface_ICS> camera, const char* key, const char* value )
+{
+    CameraParameters p = camera->getParameters();
+    
+    fprintf( stderr, "Setting '%s' to '%s'...", key, value );
+    fflush( stderr );
+    p.set( key, value );
+    camera->setParameters( p );
+    
+    p = camera->getParameters();
+    if( strcmp( p.get( key ), value ) == 0 ) {
+        fprintf( stderr, "OK\n" );
+        return true;
+    } else {
+        fprintf( stderr, "FAIL (%s)\n", p.get( key ) );
+        return false;
+    }
+}
+
 int main( int argc, char* argv[] )
 {
     const char*                     program     = basename( argv[0] );
@@ -232,22 +262,31 @@ int main( int argc, char* argv[] )
     uint32_t                        whichOne    = android::CAMERA_FACING_BACK;
     status_t                        s;
     uint32_t                        count;
-    const char*                     ofile       = "/system/data/snapshot.jpg";
+    const char*                     ofile       = "/data/snapshot.jpg";
     const char*                     effect      = CameraParameters::EFFECT_NONE;
     const char*                     flash       = CameraParameters::FLASH_MODE_AUTO;
+    const char*                     balance     = CameraParameters::WHITE_BALANCE_AUTO;
+    const char*                     scene       = CameraParameters::SCENE_MODE_AUTO;
+    const char*                     exposure    = "0";
+    const char*                     focus       = CameraParameters::FOCUS_MODE_AUTO;
     extern char*                    optarg;
     extern int                      optopt;
     extern int                      optind;
     int                             c;
     bool                            autoFocus   = true;
+    FILE*                           fout;
     
     signal( SIGINT, handleSigInt );
     
     fprintf( stderr, "--- %s [%s %s %s] ---\n", program, __FILE__, __DATE__, __TIME__ );
     LOGD( "---------- %s [%s %s %s] ----------\n", program, __FILE__, __DATE__, __TIME__ );
     
-    while( ( c = getopt( argc, argv, ":e:f:no:" ) ) != -1 ) {
+    while( ( c = getopt( argc, argv, ":c:e:f:no:s:w:x:" ) ) != -1 ) {
         switch( c ) {
+            case 'c':
+                focus = optarg;
+                break;
+
             case 'e':
                 effect = optarg;
                 break;
@@ -256,13 +295,29 @@ int main( int argc, char* argv[] )
                 flash = optarg;
                 break;
             
+            case 'n':
+                autoFocus = false;
+                break;
+            
             case 'o':
                 ofile = optarg;
                 break;
             
-            case 'n':
-                autoFocus = false;
+            case 's':
+                scene = optarg;
                 break;
+            
+            case 'w':
+                balance = optarg;
+                break;
+            
+            case 'x':
+                exposure = optarg;
+                break;
+            
+            case ':':
+                fprintf( stderr, "Option -%c requires an operand\n", optopt );
+                return 1;
             
             case '?':
                 fprintf( stderr, "Unrecognized option: -%c\n", optopt );
@@ -294,8 +349,27 @@ int main( int argc, char* argv[] )
     
     dumpSupportedParameters( camera, whichOne );
     
-    /* Set parameters from command-line options */
-    
+    /*
+        Set parameters from command-line options
+    */
+    if( !setParameter( camera, CameraParameters::KEY_WHITE_BALANCE, balance ) ) {
+        return 1;
+    }
+    if( !setParameter( camera, CameraParameters::KEY_EFFECT, effect ) ) {
+        return 1;
+    }
+    if( !setParameter( camera, CameraParameters::KEY_SCENE_MODE, scene ) ) {
+        return 1;
+    }
+    if( !setParameter( camera, CameraParameters::KEY_FLASH_MODE, flash ) ) {
+        return 1;
+    }
+    if( !setParameter( camera, CameraParameters::KEY_FOCUS_MODE, focus ) ) {
+        return 1;
+    }
+    if( !setParameter( camera, CameraParameters::KEY_EXPOSURE_COMPENSATION, exposure ) ) {
+        return 1;
+    }
     
     dumpCurrentParameters( camera, whichOne );
 
@@ -339,7 +413,7 @@ int main( int argc, char* argv[] )
             case PREVIEW_STARTED:
                 if( autoFocus ) {
                     camera->enableMsgType( android::CAMERA_MSG_FOCUS );
-                    fprintf( stderr, "Starting autofocus..." );
+                    fprintf( stderr, "OK\nStarting autofocus..." );
                     LOGD( "Starting autofocus..." );
                     fflush( stderr );
                     if( ( s = camera->autoFocus() ) != OK ) {
@@ -365,9 +439,24 @@ int main( int argc, char* argv[] )
             
             case IMAGE_CAPTURED:
                 // save picture and exit
-                fprintf( stderr, "OK\n" );
-                LOGD( "Image captured" );
-                
+                fprintf( stderr, "OK\nSaving to '%s'...", ofile );
+                LOGD( "Image captured, saving to %s", ofile );
+                fflush( stderr );
+                fout = fopen( ofile, "wb" );
+                if( fout ) {
+                    size_t n = fwrite( (const void*)data, length, 1, fout );
+                    if( n == 1 ) {
+                        fprintf( stderr, "wrote %d bytes\n", length );
+                        fclose( fout );
+                    } else {
+                        LOGE( "fwrite() returned %d: (%d) %s", n, errno, strerror( errno ) );
+                        fprintf( stderr, "FAIL: (%d) %s\n", errno, strerror( errno ) );
+                        return 1;
+                    }
+                } else {
+                    fprintf( stderr, "FAIL: (%d) %s\n", errno, strerror( errno ) );
+                    return 1;
+                }
                 exit = true;
                 break;
             
