@@ -274,6 +274,7 @@ int main( int argc, char* argv[] )
     extern int                      optind;
     int                             c;
     bool                            autoFocus   = true;
+    bool                            help        = false;
     FILE*                           fout;
     
     signal( SIGINT, handleSigInt );
@@ -281,7 +282,7 @@ int main( int argc, char* argv[] )
     fprintf( stderr, "--- %s [%s %s %s] ---\n", program, __FILE__, __DATE__, __TIME__ );
     LOGD( "---------- %s [%s %s %s] ----------\n", program, __FILE__, __DATE__, __TIME__ );
     
-    while( ( c = getopt( argc, argv, ":c:e:f:no:s:w:x:" ) ) != -1 ) {
+    while( ( c = getopt( argc, argv, ":c:e:f:hno:s:w:x:" ) ) != -1 ) {
         switch( c ) {
             case 'c':
                 focus = optarg;
@@ -295,7 +296,17 @@ int main( int argc, char* argv[] )
                 flash = optarg;
                 break;
             
+            case 'h':
+                help = true;
+                break;
+            
             case 'n':
+                /*
+                    Note that turning off the auto-focus, at least on ICS,
+                    also seems to prevent white-balance and exposure
+                    adjustment.  On the other hand, the image capture is
+                    faster.
+                */
                 autoFocus = false;
                 break;
             
@@ -396,6 +407,7 @@ int main( int argc, char* argv[] )
         return 1;
     }
    
+    /* Events are injected by calling fireEvent(), above. */
     LOGD( "----- Entering event loop -----" );
     bool exit = false;
     while( !exit ) {
